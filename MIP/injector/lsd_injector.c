@@ -8,6 +8,9 @@
 #include <mach-o/loader.h>
 #include <mach-o/dyld.h>
 #include "injectd_client/injectd_client.h"
+#include <stdbool.h>
+#include <unistd.h>
+#include <stdio.h>
 
 // Private APIs
 extern mach_port_t xpc_dictionary_copy_mach_send(xpc_object_t, const char *);
@@ -44,31 +47,6 @@ static const char *MIP_root_path(void)
     return ret;
 }
 
-/* We want the user data to be accessible from all processes, but some processes (for
-   example, Chrome's sub-processes) have a very strict sandbox profile so putting the
-   data in the user's home folder won't always work. /usr/lib, on the other hand, is
-   accessible from all processes (Otherwise they're pretty much worthless to hook in
-   the first place), so we put our data in /usr/lib/mip/user_data/<uid>/. We also set
-   a symlink in the user's Library folder, for easier access. */
-static void create_user_data_folder(pid_t pid)
-{
-    struct proc_bsdinfo proc;
-    proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &proc, sizeof(proc));
-    
-    char path[PATH_MAX];
-    sprintf(path, "%s/user_data/%d", MIP_root_path(), proc.pbi_uid);
-    
-    if (mkdir(path, 0755)) return; // Might already exist
-    chown(path, proc.pbi_uid, proc.pbi_gid);
-    
-    struct passwd *pw = getpwuid(proc.pbi_uid);
-    char library_path[PATH_MAX];
-    if (snprintf(library_path, sizeof(library_path), "%s/Library/MIP", pw->pw_dir) < sizeof(library_path)) {
-        symlink(path, library_path);
-        lchown(library_path, proc.pbi_uid, proc.pbi_gid);
-    }
-}
-
 static void handleClientMessageHook_common(uint64_t command, xpc_object_t dict)
 {
     /* Command 500 is sent by all GUI processes to launchservicesd when they launch.
@@ -78,13 +56,16 @@ static void handleClientMessageHook_common(uint64_t command, xpc_object_t dict)
        and continues normal execution. */
     
     if (command == 500) {
+        /* Mavericks port: kill switch. `sudo touch <MIP root>/disabled` stops
+           all injection immediately, without restarting launchservicesd. */
+        char disabled[PATH_MAX];
+        snprintf(disabled, sizeof(disabled), "%s/disabled", MIP_root_path());
+        if (access(disabled, F_OK) == 0) return;
+
         audit_token_t token;
         xpc_dictionary_get_audit_token(dict, &token);
         pid_t pid = audit_token_to_pid(token);
-        
-        /* While strictly speaking this should be loader's responsibility to create this folder,
-           this function must run as root, so it is done by the injector. */
-        create_user_data_folder(pid);
+
         inject_to_pid(pid, MIP_loader_path(), false);
     }
 }
@@ -98,120 +79,91 @@ static uint64_t xpc_dictionary_get_int64_hook(xpc_object_t dict, const char *key
     return ret;
 }
 
-#if __arm64__
+/* Mavericks port: upstream patches launchservicesd's own import of
+   xpc_dictionary_get_int64. On 10.9 the server code that reads the "command"
+   key (LSXPCClientConnection::handleMessage) lives in
+   LaunchServices.framework instead, so rebind the import in every loaded image
+   (fishhook-style, via each image's indirect symbol table), except our own. */
 
-// Derived from code by khanhduytran0 {
-#define _COMM_PAGE_START_ADDRESS (0x0000000FFFFFC000ULL)
-#define _COMM_PAGE_TPRO_WRITE_ENABLE (_COMM_PAGE_START_ADDRESS + 0x0D0)
-#define _COMM_PAGE_TPRO_WRITE_DISABLE (_COMM_PAGE_START_ADDRESS + 0x0D8)
+#include <mach-o/nlist.h>
+#include <mach/mach.h>
+#include <syslog.h>
 
-static bool os_tpro_is_supported(void)
+static const struct mach_header_64 *own_header(void)
 {
-    if (*(uint64_t*)_COMM_PAGE_TPRO_WRITE_ENABLE) {
-        return true;
+    Dl_info info;
+    dladdr((void *)&xpc_dictionary_get_int64_hook, &info);
+    return (const struct mach_header_64 *)info.dli_fbase;
+}
+
+static void make_writable(void **address)
+{
+    vm_address_t page = (vm_address_t)address & ~(vm_address_t)(PAGE_SIZE - 1);
+    if (vm_protect(mach_task_self(), page, PAGE_SIZE, false, VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
+        vm_protect(mach_task_self(), page, PAGE_SIZE, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     }
-    return false;
 }
 
-__attribute__((naked)) bool os_thread_self_tpro_is_writeable(void)
+static void rebind_in_image(const struct mach_header *mh, intptr_t slide)
 {
-    __asm__ __volatile__ (
-                          "mrs             x0, s3_6_c15_c1_5\n"
-                          "ubfx            x0, x0, #0x24, #1;\n"
-                          "ret\n"
-                          );
-}
+    const struct mach_header_64 *header = (const struct mach_header_64 *)mh;
+    if (header->magic != MH_MAGIC_64 || header == own_header()) return;
 
-void os_thread_self_restrict_tpro_to_rw(void)
-{
-    __asm__ __volatile__ (
-                          "mov x0, %0\n"
-                          "ldr x0, [x0]\n"
-                          "msr s3_6_c15_c1_5, x0\n"
-                          "isb sy\n"
-                          :: "r" (_COMM_PAGE_TPRO_WRITE_ENABLE)
-                          : "memory", "x0"
-                          );
-    return;
-}
+    /* Only the image that serves check-ins: other libraries in launchservicesd
+       may read unrelated "command" keys. */
+    Dl_info image_info;
+    if (!dladdr(mh, &image_info) || !image_info.dli_fname) return;
+    const char *suffix = "/LaunchServices.framework/Versions/A/LaunchServices";
+    size_t name_length = strlen(image_info.dli_fname), suffix_length = strlen(suffix);
+    if (name_length < suffix_length || strcmp(image_info.dli_fname + name_length - suffix_length, suffix) != 0) return;
 
-void os_thread_self_restrict_tpro_to_ro(void)
-{
-    __asm__ __volatile__ (
-                          "mov x0, %0\n"
-                          "ldr x0, [x0]\n"
-                          "msr s3_6_c15_c1_5, x0\n"
-                          "isb sy\n"
-                          :: "r" (_COMM_PAGE_TPRO_WRITE_DISABLE)
-                          : "memory", "x0"
-                          );
-    return;
-}
-
-// }
-
-static void unprotect_page(void *page)
-{
-    if (mprotect(page, 0x4000, PROT_READ | PROT_WRITE) == 0) {
-        return;
+    const struct segment_command_64 *linkedit = NULL;
+    const struct symtab_command *symtab = NULL;
+    const struct dysymtab_command *dysymtab = NULL;
+    const struct load_command *cmd = (const struct load_command *)(header + 1);
+    for (unsigned i = 0; i < header->ncmds; i++, cmd = (const struct load_command *)((const char *)cmd + cmd->cmdsize)) {
+        if (cmd->cmd == LC_SEGMENT_64 && strcmp(((const struct segment_command_64 *)cmd)->segname, SEG_LINKEDIT) == 0) {
+            linkedit = (const struct segment_command_64 *)cmd;
+        }
+        else if (cmd->cmd == LC_SYMTAB) {
+            symtab = (const struct symtab_command *)cmd;
+        }
+        else if (cmd->cmd == LC_DYSYMTAB) {
+            dysymtab = (const struct dysymtab_command *)cmd;
+        }
     }
-    void *temp = malloc(0x4000);
-    memcpy(temp, page, 0x4000);
-    vm_deallocate(mach_task_self(), (vm_address_t)page, 0x4000);
-    vm_allocate(mach_task_self(), (vm_address_t *)&page, 0x4000, VM_FLAGS_FIXED);
-    memcpy(page, temp, 0x4000);
-    free(temp);
+    if (!linkedit || !symtab || !dysymtab || !dysymtab->nindirectsyms) return;
+
+    uintptr_t linkedit_base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
+    const struct nlist_64 *symbols = (const struct nlist_64 *)(linkedit_base + symtab->symoff);
+    const char *strings = (const char *)(linkedit_base + symtab->stroff);
+    const uint32_t *indirect = (const uint32_t *)(linkedit_base + dysymtab->indirectsymoff);
+
+    cmd = (const struct load_command *)(header + 1);
+    for (unsigned i = 0; i < header->ncmds; i++, cmd = (const struct load_command *)((const char *)cmd + cmd->cmdsize)) {
+        if (cmd->cmd != LC_SEGMENT_64) continue;
+        const struct segment_command_64 *segment = (const struct segment_command_64 *)cmd;
+        if (strcmp(segment->segname, SEG_DATA) != 0) continue;
+        const struct section_64 *section = (const struct section_64 *)(segment + 1);
+        for (unsigned j = 0; j < segment->nsects; j++, section++) {
+            uint32_t type = section->flags & SECTION_TYPE;
+            if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
+            void **pointers = (void **)(slide + section->addr);
+            for (unsigned k = 0; k < section->size / sizeof(void *); k++) {
+                uint32_t index = indirect[section->reserved1 + k];
+                if (index & (INDIRECT_SYMBOL_ABS | INDIRECT_SYMBOL_LOCAL)) continue;
+                if (index >= symtab->nsyms) continue;
+                if (strcmp(strings + symbols[index].n_un.n_strx, "_xpc_dictionary_get_int64") != 0) continue;
+                make_writable(&pointers[k]);
+                pointers[k] = (void *)xpc_dictionary_get_int64_hook;
+                syslog(LOG_NOTICE, "MIP: hooked xpc_dictionary_get_int64 in %s", image_info.dli_fname);
+            }
+        }
+    }
 }
-#endif
 
 static void __attribute__((constructor)) hook_lsd(void)
 {
-    struct mach_header_64 *header = (typeof (header))_dyld_get_image_header(0);
-    const struct load_command *cmd = (typeof(cmd))(header + 1);
-    const struct segment_command_64 *first = NULL;
-    const struct segment_command_64 *data = NULL;
-    for (unsigned i = 0; i < header->ncmds; i++, cmd = (typeof(cmd)) ((char*) cmd + cmd->cmdsize)) {
-        if (cmd->cmd == LC_SEGMENT_64) {
-            if (!first && ((typeof(first))cmd)->filesize ) {
-                first = (typeof(first)) cmd;
-            }
-    #ifndef __arm64__
-            if (strcmp(((typeof(data))cmd)->segname, "__DATA") == 0) {
-    #else
-            if (strcmp(((typeof(data))cmd)->segname, "__DATA_CONST") == 0) {
-    #endif
-                data = (typeof(data))cmd;
-                break;
-            }
-        }
-    }
-    uintptr_t slide = (uintptr_t)header - first->vmaddr;
-    void **address = (void **)(data->vmaddr + slide);
-    void **end = (void **)(data->vmaddr + data->vmsize + slide);
-#if __arm64__
-    bool has_tpro = os_tpro_is_supported();
-#endif
-    while (address < end) {
-    #if __arm64__
-        if ((uintptr_t)__builtin_ptrauth_strip(*address, 0) == (uintptr_t)__builtin_ptrauth_strip(&xpc_dictionary_get_int64, 0)) {
-            bool revert_tpro_state = false;
-            if (!has_tpro) {
-                unprotect_page((void *)(((uintptr_t)address) & ~0x3FFF));
-            }
-            else if (!os_thread_self_tpro_is_writeable()) {
-                os_thread_self_restrict_tpro_to_rw();
-                revert_tpro_state = true;
-            }
-            *address = ptrauth_sign_unauthenticated((void *)((uintptr_t)__builtin_ptrauth_strip(&xpc_dictionary_get_int64_hook, 0)), ptrauth_key_function_pointer, address);
-            if (revert_tpro_state) {
-                os_thread_self_restrict_tpro_to_ro();
-            }
-        }
-    #else
-        if (*address == xpc_dictionary_get_int64) {
-            *address = xpc_dictionary_get_int64_hook;
-        }
-    #endif
-        address++;
-    }
+    /* Called for every image already loaded, then for each one loaded later. */
+    _dyld_register_func_for_add_image(rebind_in_image);
 }

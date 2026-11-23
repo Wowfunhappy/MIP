@@ -99,36 +99,10 @@ void __attribute__((preserve_all)) c_late_inject(void)
 }
 #endif
 
-void __attribute__((preserve_all)) c_entry(void)
+/* Called by `entry` below with all caller-saved state already preserved, so
+   this can be ordinary C. */
+void c_entry(void)
 {
-#ifdef ROSETTA
-    /*
-      For some reason, calling `dlopen` from the usual `lsdinjector` context,
-      specifically while using the Rosetta runtime, some Mach port connection
-      gets screwed up, which ends up crashing the next time it is used. If we
-      detect this scenario,  we inject the dlopen call to  after we return to
-      _LSApplicationCheckIn, which is safe.
-    */
-    uintptr_t _LSApplicationCheckIn = (uintptr_t) get_symbol_from_header(
-        get_header_by_path("/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/LaunchServices"),
-        "__LSApplicationCheckIn");
-        
-    if (_LSApplicationCheckIn) {
-        uintptr_t *stack = __builtin_frame_address(4);
-        for (unsigned i = 0; i < 128; i++) {
-            /* TODO: This will work for lsdinjector, but this can probably be improved.
-               It might have false positives (and even crashes) on some manual `inject`
-               scenarios. */
-            if (stack[i] > _LSApplicationCheckIn && stack[i] < _LSApplicationCheckIn + 8192) {
-                ret_address = stack[i];
-                stack_ret = &stack[i];
-                stack[i] = (uintptr_t)&late_inject;
-                return;
-            }
-        }
-    }
-#endif
-    
     typeof(dlopen) *$dlopen = NULL;
 
     /* We can't call dyld`dlopen when dyld3 is being used, so we must find libdyld`dlopen and call that instead */
@@ -139,15 +113,68 @@ void __attribute__((preserve_all)) c_entry(void)
     }
 }
 
+/* Mavericks port: the clang shipped for 10.9 (Xcode 6) does not implement the
+   preserve_all calling convention, so the entry point saves every caller-saved
+   register (and the flags) by hand before calling into C.
+
+   On entry the stack is as if `entry` had been called: rsp % 16 == 8. */
 void __attribute__((naked)) entry(void)
 {
-    __asm__ ("push %rax\n" // Alignment dummy
-             "push %r11\n"
-             "pushfq\n"
+    __asm__ ("pushfq\n"                  // rsp % 16 == 0
+             "push %rax\n"
+             "push %rcx\n"
+             "push %rdx\n"
+             "push %rsi\n"
+             "push %rdi\n"
+             "push %r8\n"
+             "push %r9\n"
+             "push %r10\n"
+             "push %r11\n"                // 9 pushes: rsp % 16 == 8
+             "sub $264, %rsp\n"           // 16 xmm registers + 8 for alignment
+             "movdqu %xmm0, 0(%rsp)\n"
+             "movdqu %xmm1, 16(%rsp)\n"
+             "movdqu %xmm2, 32(%rsp)\n"
+             "movdqu %xmm3, 48(%rsp)\n"
+             "movdqu %xmm4, 64(%rsp)\n"
+             "movdqu %xmm5, 80(%rsp)\n"
+             "movdqu %xmm6, 96(%rsp)\n"
+             "movdqu %xmm7, 112(%rsp)\n"
+             "movdqu %xmm8, 128(%rsp)\n"
+             "movdqu %xmm9, 144(%rsp)\n"
+             "movdqu %xmm10, 160(%rsp)\n"
+             "movdqu %xmm11, 176(%rsp)\n"
+             "movdqu %xmm12, 192(%rsp)\n"
+             "movdqu %xmm13, 208(%rsp)\n"
+             "movdqu %xmm14, 224(%rsp)\n"
+             "movdqu %xmm15, 240(%rsp)\n"
              "call _c_entry\n"
-             "popfq\n"
+             "movdqu 0(%rsp), %xmm0\n"
+             "movdqu 16(%rsp), %xmm1\n"
+             "movdqu 32(%rsp), %xmm2\n"
+             "movdqu 48(%rsp), %xmm3\n"
+             "movdqu 64(%rsp), %xmm4\n"
+             "movdqu 80(%rsp), %xmm5\n"
+             "movdqu 96(%rsp), %xmm6\n"
+             "movdqu 112(%rsp), %xmm7\n"
+             "movdqu 128(%rsp), %xmm8\n"
+             "movdqu 144(%rsp), %xmm9\n"
+             "movdqu 160(%rsp), %xmm10\n"
+             "movdqu 176(%rsp), %xmm11\n"
+             "movdqu 192(%rsp), %xmm12\n"
+             "movdqu 208(%rsp), %xmm13\n"
+             "movdqu 224(%rsp), %xmm14\n"
+             "movdqu 240(%rsp), %xmm15\n"
+             "add $264, %rsp\n"
              "pop %r11\n"
-             "pop %rax\n" // Alignment dummy
+             "pop %r10\n"
+             "pop %r9\n"
+             "pop %r8\n"
+             "pop %rdi\n"
+             "pop %rsi\n"
+             "pop %rdx\n"
+             "pop %rcx\n"
+             "pop %rax\n"
+             "popfq\n"
              "ret\n");
 }
 

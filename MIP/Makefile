@@ -1,15 +1,25 @@
-.SECONDARY:
-.PHONY: all install uninstall
+# Mavericks (OS X 10.9) port of MIP's build.
+#
+# Differences from upstream, all forced by 10.9 or its toolchain (Xcode 6):
+#  - MIP_ROOT is /usr/share/mip. Like /usr/lib, it is readable (and loadable)
+#    from every sandboxed process on 10.9, including Safari's WebContent.
+#  - No injectd: launchservicesd on 10.9 runs as root without a sandbox and
+#    can take task ports itself (injector/direct_inject.c).
+#  - Payload binaries are extracted with tools/payload2bin.py, not gobjcopy.
+#  - Code signing is optional; 10.9 has no library validation.
+#  - Installed with a .pkg (`make pkg` builds build/MIP.pkg), not `make install`.
 
-LDFLAGS := -g -mmacosx-version-min=10.10 -lc -F/System/Library/PrivateFrameworks
-CFLAGS := -g -mmacosx-version-min=10.10 -I. -Werror -O3 -Wno-unknown-warning-option -Wno-deprecated-declarations -Wno-interrupt-service-routine
-SYSROOT ?= $(shell xcodebuild -sdk macosx -version Path 2> /dev/null)
-ifeq ($(SYSROOT),)
-SYSROOT := $(shell find /Library/Developer/CommandLineTools/SDKs -maxdepth 1 -name "MacOSX1*.sdk" | sort -V | tail -n 1)
-endif
-CFLAGS += -isysroot $(SYSROOT)
+.SECONDARY:
+.PHONY: all pkg uninstall clean
+
+SYSROOT ?= $(shell xcrun --show-sdk-path 2> /dev/null)
+MIN_OS := -mmacosx-version-min=10.9
+CFLAGS := -g $(MIN_OS) -isysroot $(SYSROOT) -I. -Werror -O3 -Wno-unknown-warning-option -Wno-deprecated-declarations
+LDFLAGS := -g $(MIN_OS) -isysroot $(SYSROOT)
 SUBSTITUTE ?= YES
-MIP_ROOT ?= /Library/Apple/System/Library/Frameworks/mip
+MIP_ROOT ?= /usr/share/mip
+PKG_ID := com.Wowfunhappy.MavMIP
+PKG_VERSION ?= $(shell date +%Y.%m.%d)
 
 ifneq ($(SUBSTITUTE),YES)
 ifneq ($(SUBSTITUTE),NO)
@@ -17,118 +27,87 @@ $(error SUBSTITUTE must be either YES or NO)
 endif
 endif
 
-LOADER_SOURCES := loader/loader.m
+LOADER_SOURCES := loader/loader.m loader/simbl_compat.m
 ifeq ($(SUBSTITUTE),YES)
-SUBSTITUTE_CFLAGS := -Ithird-party/substitute/lib -Ithird-party/substitute/vendor
+SUBSTITUTE_CFLAGS := -Ithird-party/substitute/lib -Ithird-party/substitute/vendor -Icompat -DMIP_MAVERICKS=1
 LOADER_SOURCES += $(shell find third-party/substitute -name "*.c" -o -name "*.S")
 endif
 
-ifeq ($(shell uname -m),arm64)
-ARCH1 := arm64e
-ARCH2 := x86_64
-DUAL_ARCH ?= 1
-CFLAGS += -DROSETTA
+ifneq ($(SIGN_IDENTITY),)
+CODESIGN_TARGET := codesign -f -s "$(SIGN_IDENTITY)"
 else
-ARCH1 := x86_64
-ARCH2 := i386
+CODESIGN_TARGET := @true
 endif
 
+all: build/lsdinjector.dylib build/loader.dylib build/inject
 
-SIGN_IDENTITY ?= CodeSign
-CODESIGN_TARGET := codesign -s "$(SIGN_IDENTITY)"
-
-all: build/lsdinjector.dylib build/loader.dylib build/inject build/injectd local.lsdinjector.plist
-
-build/lsdinjector.dylib: build/injector/lsd_injector.c.o build/injector/injectd_client/injectd_client.m.o
-	$(CC) $(LDFLAGS) -arch $(ARCH1) $^ -lbsm -framework Foundation -shared -o $@
+build/lsdinjector.dylib: build/injector/lsd_injector.c.o build/injector/direct_inject.c.o build/injector/injector.o
+	$(CC) $(LDFLAGS) -arch x86_64 $^ -lbsm -shared -o $@
 	$(CODESIGN_TARGET) $@
 
-build/loader.dylib: $(LOADER_SOURCES)
-	$(CC) $(CFLAGS) $(SUBSTITUTE_CFLAGS) $(LDFLAGS) -install_name @loader_path/../../../../loader.dylib -framework Foundation -shared -arch $(ARCH1) $(if $(DUAL_ARCH), -arch $(ARCH2)) $^ -o $@
+build/loader.dylib: $(LOADER_SOURCES) loader/loader.h loader/simbl_compat.h
+	$(CC) $(CFLAGS) $(SUBSTITUTE_CFLAGS) $(LDFLAGS) -install_name $(MIP_ROOT)/loader.dylib -framework Foundation -shared -arch x86_64 -arch i386 $(filter %.m %.c %.S,$^) -o $@
 	$(CODESIGN_TARGET) $@
 
-build/injectd: build/injector/injector.o build/injector/injectd.m.o | injector/injectd.entitlements
-	mkdir -p $(dir $@)
-	$(CC) $(LDFLAGS) -framework Foundation $^ -o $@ -arch $(ARCH1)
-	$(CODESIGN_TARGET) --entitlements injector/injectd.entitlements $@
-	
-build/inject: build/injector/inject.c.o build/injector/injectd_client/injectd_client.m.o
-	mkdir -p $(dir $@)
-	$(CC) $(LDFLAGS) -framework Foundation $^ -o $@ -arch $(ARCH1)
+build/inject: build/injector/inject.c.o build/injector/direct_inject.c.o build/injector/injector.o
+	$(CC) $(LDFLAGS) -arch x86_64 $^ -o $@
 	$(CODESIGN_TARGET) $@
 
-build/injector/injector.o: build/injector/inject/inject.c.o build/injector/payloads/injected_$(ARCH1).c.bin build/injector/payloads/injected_$(ARCH2).c.bin
-	ld -r $(filter %.o,$^) -o $@ -sectcreate __INJ_$(ARCH1) __inj_$(ARCH1) build/injector/payloads/injected_$(ARCH1).c.bin -sectcreate __INJ_$(ARCH2) __inj_$(ARCH2) build/injector/payloads/injected_$(ARCH2).c.bin
-	
+build/injector/injector.o: build/injector/inject/inject.c.o build/injector/payloads/injected_x86_64.c.bin build/injector/payloads/injected_i386.c.bin
+	ld -r -arch x86_64 $(filter %.o,$^) -o $@ \
+		-sectcreate __INJ_x86_64 __inj_x86_64 build/injector/payloads/injected_x86_64.c.bin \
+		-sectcreate __INJ_i386 __inj_i386 build/injector/payloads/injected_i386.c.bin
+
 build/%.c.o: %.c
 	mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -arch $(ARCH1) -c $^ -o $@
-	
-build/%.m.o: %.m
+	$(CC) $(CFLAGS) -arch x86_64 -c $< -o $@
+
+PAYLOAD_FLAGS := -g $(MIN_OS) -isysroot $(SYSROOT) -I. -Oz -fno-exceptions -fno-asynchronous-unwind-tables \
+	-fno-builtin -nostdlib -shared -Wl,-undefined,error \
+	-Wl,-sectalign,__TEXT,__text,1000 -Wl,-order_file,injector/payloads/order
+
+build/injector/payloads/injected_%.c.dylib: injector/payloads/injected_%.c injector/payloads/injected.h
 	mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -fobjc-arc -arch $(ARCH1) -c $^ -o $@
+	$(CC) $(PAYLOAD_FLAGS) -arch $* $< -o $@
 
-	
-build/injector/payloads/injected_i386.c.dylib: injector/payloads/injected_i386.c
-	mkdir -p $(dir $@)
-		
-	@# Fix the unaligned movaps LLVM bug, and convert iret to ret.
-	$(CC) $(CFLAGS) -fno-exceptions -arch i386 -Oz $^ -S -o - \
-		| sed "s/^	iret/	ret/g" \
-		| sed "s/^	movaps	%xmm7, -32(%ebp)/	movaps	%xmm7, -40(%ebp)/g" \
-		| sed "s/^	movaps	-32(%ebp), %xmm7/	movaps	-40(%ebp), %xmm7/g" \
-		| clang -L. -Wl,-sectalign,__TEXT,__text,4000 -Wl,-order_file,injector/payloads/order -shared -isysroot $(SYSROOT) -xassembler - -arch i386 -o $@
-	
-build/injector/payloads/injected_x86_64.c.dylib: injector/payloads/injected_x86_64.c
-	mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -Wl,-sectalign,__TEXT,__text,4000 -fno-exceptions -shared -arch x86_64 -Oz -Wl,-order_file,injector/payloads/order $^ -o $@
+build/injector/payloads/%.bin: build/injector/payloads/%.dylib tools/payload2bin.py
+	python tools/payload2bin.py $< $@
 
-build/injector/payloads/injected_arm64e.c.dylib: injector/payloads/injected_arm64e.c
-	mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -Wl,-sectalign,__TEXT,__text,4000 -fno-exceptions -shared -arch arm64e -Oz -Wl,-order_file,injector/payloads/order $^ -o $@
+PKGROOT := build/pkgroot
 
-build/injector/payloads/%.bin: build/injector/payloads/%.dylib
-	gobjcopy -Obinary $^ $@
-
-	
-
-install: all
-	sudo mkdir -p $(MIP_ROOT)/user_data
-	sudo mkdir -p $(MIP_ROOT)/Bundles
-	sudo mkdir -p /usr/local/include/mip
-	@# We remove the old libraries before copying, overwriting causes codesigning issues.
-	-@sudo rm -f $(MIP_ROOT)/{lsdinjector.dylib,loader.dylib,injectd}
-	sudo cp build/lsdinjector.dylib build/loader.dylib build/injectd $(MIP_ROOT)
-	sudo cp build/inject /usr/local/bin/
-	sudo cp loader/loader_public.h /usr/local/include/mip/loader.h	
-	sed "s=@MIP_ROOT@=$(MIP_ROOT)=g" local.injectd.plist | sudo dd of=/Library/LaunchDaemons/local.injectd.plist
-	sed "s=@MIP_ROOT@=$(MIP_ROOT)=g" local.lsdinjector.plist | sudo dd of=/Library/LaunchDaemons/local.lsdinjector.plist
-
-	sudo defaults write /Library/Preferences/com.apple.security.libraryvalidation.plist DisableLibraryValidation -bool true
-	-sudo launchctl bootstrap system /Library/LaunchDaemons/local.injectd.plist
-	if nvram boot-args | grep -v tss_should_crash=0; then \
-		sudo nvram boot-args="`nvram boot-args | cut -c 11-` tss_should_crash=0"; \
-		if nvram boot-args | grep -v tss_should_crash=0; then\
-			echo "Failed to add tss_should_crash=0. If you're running macOS Ventura or newer in a VM, you will need to update this bootarg manually."; \
-		else \
-			echo "Added tss_should_crash=0 boot argument. If you're running macOS Ventura or newer, a reboot is required"; \
-		fi \
-	fi
-	if nvram boot-args | grep -v amfi_get_out_of_my_way=1; then \
-		sudo nvram boot-args="`nvram boot-args | cut -c 11-` amfi_get_out_of_my_way=1"; \
-		if nvram boot-args | grep -v amfi_get_out_of_my_way=1; then\
-			echo "Failed to add amfi_get_out_of_my_way=1. If you're running macOS Sonoma or newer in a VM, you will need to update this bootarg manually."; \
-		else \
-			echo "Added amfi_get_out_of_my_way=1 boot argument. If you're running macOS Sonoma or newer, a reboot is required"; \
-		fi \
-	fi
-	(read -p "Inject MIP to launchservicesd without a restart? [y/N] " -n 1 -r; echo ; if [[ $$REPLY =~ ^[Yy]$$ ]]; then sudo inject launchservicesd $(MIP_ROOT)/lsdinjector.dylib; fi;)
+pkg: all package/Distribution.in package/scripts/postinstall
+	rm -rf $(PKGROOT) build/component build/MIP.pkg
+	mkdir -p $(PKGROOT)$(MIP_ROOT)/Bundles $(PKGROOT)/usr/local/bin $(PKGROOT)/usr/local/include/mip \
+		$(PKGROOT)/Library/LaunchDaemons build/component
+	cp build/lsdinjector.dylib build/loader.dylib $(PKGROOT)$(MIP_ROOT)/
+	cp build/inject $(PKGROOT)/usr/local/bin/
+	cp loader/loader_public.h $(PKGROOT)/usr/local/include/mip/loader.h
+	sed "s=@MIP_ROOT@=$(MIP_ROOT)=g" local.lsdinjector.plist > $(PKGROOT)/Library/LaunchDaemons/local.lsdinjector.plist
+	chmod -R u=rwX,go=rX $(PKGROOT)
+	pkgbuild --root $(PKGROOT) --identifier $(PKG_ID) --version $(PKG_VERSION) --install-location / \
+		--scripts package/scripts build/component/MIP.pkg
+	@# As in the SIMBL package: leave the permissions of existing folders (/usr/local,
+	@# /Library/Application Support, ...) alone, and ask for a logout.
+	rm -rf build/component/expanded
+	pkgutil --expand build/component/MIP.pkg build/component/expanded
+	sed -i '' -e 's/overwrite-permissions="true"/overwrite-permissions="false"/' \
+		-e 's/postinstall-action="none"/postinstall-action="logout"/' build/component/expanded/PackageInfo
+	rm build/component/MIP.pkg
+	pkgutil --flatten build/component/expanded build/component/MIP.pkg
+	rm -rf build/component/expanded
+	sed -e "s/@VERSION@/$(PKG_VERSION)/" -e "s/@KBYTES@/$$(du -sk $(PKGROOT) | cut -f1)/" \
+		package/Distribution.in > build/Distribution
+	productbuild --distribution build/Distribution --resources package/Resources \
+		--package-path build/component build/MIP.pkg
 
 uninstall:
+	-sudo launchctl unload /Library/LaunchDaemons/local.lsdinjector.plist
+	-sudo rm -f /Library/LaunchDaemons/local.lsdinjector.plist
 	-sudo rm -rf $(MIP_ROOT)
-	-sudo rm -rf /usr/include/mip
-	-sudo rm /Library/LaunchDaemons/local.lsdinjector.plist
-	-sudo defaults delete /Library/Preferences/com.apple.security.libraryvalidation.plist DisableLibraryValidation
-	
+	-sudo rm -rf /usr/local/include/mip
+	-sudo rm -f /usr/local/bin/inject
+	-sudo pkgutil --forget $(PKG_ID)
+	@echo "Uninstalled. launchservicesd keeps the injector until it restarts (log out, or reboot)."
+
 clean:
 	rm -rf build

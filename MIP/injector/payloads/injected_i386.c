@@ -11,27 +11,6 @@ __attribute__((section("__TEXT,__const"))) struct dyld_all_image_infos *dyld_inf
 
 __attribute__((section("__TEXT,__const"))) char argument[ARGUMENT_MAX_LENGTH] = ARGUMENT_MAGIC_STR;
 
-/* The interrupt calling convention does not save the flags register, so we use
-   these ASM functions to save and restore it outselves. They must be called as
-   early and as late as possible, respectively, so instructions that modify flags
-   won't destory the state. */
-
-uint32_t get_flags(void);
-/* Use fastcall for set_flags, parameters on registers are easier to work with. */
-__attribute__((fastcall)) void set_flags(uint32_t);
-
-__asm__ (
-         "_get_flags: \n"
-         "    pushfd \n"
-         "    pop %eax \n"
-         "    ret \n"
-         
-         "_set_flags: \n"
-         "    push %ecx \n"
-         "    popfd \n"
-         "    ret \n"
-         );
-
 static const struct mach_header *get_header_by_path(const char *name)
 {
     for (unsigned i = 0; i < dyld_info->infoArrayCount; i++) {
@@ -87,10 +66,8 @@ static const void *get_symbol_from_header(const struct mach_header *header, cons
 }
 
 
-void _entry()
+void c_entry(void)
 {
-    uint32_t flags = get_flags();
-    
     typeof(dlopen) *$dlopen = NULL;
     
     /* We can't call dyld`dlopen when dyld3 is being used, so we must find libdyld`dlopen and call that instead */
@@ -99,18 +76,39 @@ void _entry()
     if ($dlopen) {
         $dlopen(argument, RTLD_NOW);
     }
-	
-    set_flags(flags);
 }
 
-/* Clang on x86-32 does not support the preserve_all convention. Instead, we use
- * the interrupt attribute. The Makefile takes care of replacing iret with ret.
-   Additionally, Clang sometimes stores xmm7 on an unaligned address and crashes,
-   and since LLVM's bug tracker has been down for ages, the Makefile fixes that
-   as well. -_- */
-void __attribute__((interrupt)) entry(void * __attribute__((unused)) unused)
+/* Mavericks port: Xcode 6's clang has no x86-32 interrupt attribute, so the
+   entry point saves all general purpose, SSE and flags state by hand, aligns
+   the stack for the C call, and restores everything afterwards. */
+void __attribute__((naked)) entry(void)
 {
-    _entry();
+    __asm__ ("pushfl\n"
+             "pushal\n"
+             "movl %esp, %ebp\n"        // ebp is restored by popal
+             "subl $128, %esp\n"
+             "andl $-16, %esp\n"
+             "movdqu %xmm0, 0(%esp)\n"
+             "movdqu %xmm1, 16(%esp)\n"
+             "movdqu %xmm2, 32(%esp)\n"
+             "movdqu %xmm3, 48(%esp)\n"
+             "movdqu %xmm4, 64(%esp)\n"
+             "movdqu %xmm5, 80(%esp)\n"
+             "movdqu %xmm6, 96(%esp)\n"
+             "movdqu %xmm7, 112(%esp)\n"
+             "call _c_entry\n"
+             "movdqu 0(%esp), %xmm0\n"
+             "movdqu 16(%esp), %xmm1\n"
+             "movdqu 32(%esp), %xmm2\n"
+             "movdqu 48(%esp), %xmm3\n"
+             "movdqu 64(%esp), %xmm4\n"
+             "movdqu 80(%esp), %xmm5\n"
+             "movdqu 96(%esp), %xmm6\n"
+             "movdqu 112(%esp), %xmm7\n"
+             "movl %ebp, %esp\n"
+             "popal\n"
+             "popfl\n"
+             "ret\n");
 }
 
 /* Taken from Apple's libc */

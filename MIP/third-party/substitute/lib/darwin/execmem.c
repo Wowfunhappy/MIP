@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <pthread.h>
 
+#if !MIP_MAVERICKS /* Mavericks port: mach_msg2 definitions (macOS 14+); the 10.9 SDK has the classic ones */
 #define MACH_MSG_OPTION_NONE    0x00000000
 
 #define MACH_SEND_MSG           0x00000001
@@ -125,6 +126,7 @@ typedef struct {
 
 static mach_msg_return_t manual_mach_msg2_internal(void *data, mach_msg_option64_t option64, uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name, uint64_t rcv_size_and_priority, uint64_t timeout);
 
+#endif /* !MIP_MAVERICKS */
 int manual_sigreturn(void *, int);
 GEN_SYSCALL(sigreturn, 184);
 __typeof__(mmap) manual_mmap;
@@ -133,15 +135,20 @@ __typeof__(mprotect) manual_mprotect;
 GEN_SYSCALL(mprotect, 74);
 __typeof__(mach_msg) manual_old_mach_msg;
 GEN_SYSCALL(old_mach_msg, -31);
+#if !MIP_MAVERICKS /* mach_msg2 trap */
 mach_msg_return_t manual_mach_msg2_trap(void *data, mach_msg_option64_t option64, uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name, uint64_t rcv_size_and_priority, uint64_t timeout);
 GEN_SYSCALL(mach_msg2_trap, -47);
+#endif /* !MIP_MAVERICKS */
 __typeof__(mach_thread_self) manual_thread_self;
 GEN_SYSCALL(thread_self, -27);
+#if !MIP_MAVERICKS /* mach_msg2 */
 __attribute__((weak_import)) extern mach_msg_return_t (*mach_msg2_internal)(void *data, mach_msg_option64_t option64, uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name, uint64_t rcv_size_and_priority, uint64_t timeout);
 
+#endif /* !MIP_MAVERICKS */
 extern int __sigaction(int, struct __sigaction * __restrict,
                        struct sigaction * __restrict);
 
+#if !MIP_MAVERICKS /* mach_msg2 implementation */
 static inline mach_msg_return_t manual_mach_msg2(
         void *data,
         mach_msg_option64_t option64,
@@ -343,6 +350,7 @@ static mach_msg_return_t manual_new_mach_msg(
     return manual_new_mach_msg_overwrite(msg, option, send_size, rcv_limit, rcv_name, timeout, notify, NULL, 0);
 }
 
+#endif /* !MIP_MAVERICKS */
 static void manual_memcpy(void *restrict dest, const void *src, size_t len) {
     /* volatile to avoid compiler transformation to call to memcpy */
     volatile uint8_t *d8 = dest;
@@ -350,6 +358,10 @@ static void manual_memcpy(void *restrict dest, const void *src, size_t len) {
     while (len--)
         *d8++ = *s8++;
 }
+
+#if MIP_MAVERICKS
+typedef uint64_t mach_msg_option64_t;
+#endif
 
 static inline mach_msg_return_t manual_mach_msg(
         mach_msg_header_t *msg,
@@ -360,11 +372,12 @@ static inline mach_msg_return_t manual_mach_msg(
         mach_msg_timeout_t timeout,
         mach_port_t notify)
 {
+#if !MIP_MAVERICKS
     if ((volatile void *)&mach_msg2_internal != NULL) {
         return manual_mach_msg2(msg, option, *msg, send_size, rcv_limit, rcv_name, timeout, notify);
-    } else {
-        return manual_old_mach_msg(msg, option&0xFFFFFFFF, send_size, rcv_limit, rcv_name, timeout, notify);
     }
+#endif
+    return manual_old_mach_msg(msg, option&0xFFFFFFFF, send_size, rcv_limit, rcv_name, timeout, notify);
 }
 
 #pragma GCC diagnostic push

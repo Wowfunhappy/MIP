@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 
 #include "loader.h"
+#include "simbl_compat.h"
 
 #define objc_collectingEnabled() (@selector(retain) == @selector(release))
 
@@ -28,28 +29,26 @@ const char *MIP_root_path(void)
     return ret;
 }
 
+/* Mavericks port: MIP keeps no per-user data of its own. This is kept for
+   bundles written for upstream MIP that store their settings here; sandboxed
+   processes can't read it. */
 const char *MIP_user_data_path(void)
 {
     static char user_data_path[PATH_MAX] = "";
 
     if (!user_data_path[0]) {
-        sprintf(user_data_path, "%s/user_data/%d", MIP_root_path(), getuid());
+        NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/MIP"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
+        strlcpy(user_data_path, path.fileSystemRepresentation, sizeof(user_data_path));
     }
     return user_data_path;
 }
 
 bool should_inject_bundle(NSBundle *tweakBundle,
-                          NSString *mainExecutableName,
-                          NSArray<NSString *> *globalyDisabledBundles)
+                          NSString *mainExecutableName)
 {
     NSDictionary *plist = tweakBundle.infoDictionary;
     bool blacklistMode = [plist[@"MIPUseBlacklistMode"] boolValue];
-    
-    // Skip tweak if it is globally disabled
-    if ([globalyDisabledBundles containsObject:tweakBundle.bundleIdentifier]) {
-        // Not affected by blacklist mode
-        return false;
-    }
     
     // Skip tweak if a matching bundle is excluded
     for (NSString *entry in plist[@"MIPExcludedBundleNames"]) {
@@ -83,9 +82,6 @@ static void __attribute__((constructor)) loader(void)
 {
     @autoreleasepool {
         @try {
-            NSDictionary *user_preferences = [NSDictionary dictionaryWithContentsOfFile:
-                [@(MIP_user_data_path()) stringByAppendingPathComponent:@"settings.plist"]
-            ];
 
             NSFileManager *fm = NSFileManager.defaultManager;
             
@@ -100,15 +96,21 @@ static void __attribute__((constructor)) loader(void)
             _NSGetExecutablePath(executable_path, &executable_path_length);
             
             NSString *executable_name = @(executable_path).lastPathComponent;
-            NSArray *disabled_bundles = user_preferences[@"MIPDisabledBundles"];
+            NSMutableArray *simbl_plugins = [NSMutableArray array];
             
             // Enumerate tweak bundles and determine whether or not to load each
             for (NSURL *bundle_url in tweakBundles) {
                 
                 NSBundle *tweakBundle = [NSBundle bundleWithURL:bundle_url];
+
+                /* Mavericks port: SIMBL plugins follow SIMBL's rules (simbl_compat.m). */
+                if (MIP_is_simbl_plugin(tweakBundle)) {
+                    [simbl_plugins addObject:tweakBundle];
+                    continue;
+                }
+
                 bool should_inject = should_inject_bundle(tweakBundle,
-                                                          executable_name,
-                                                          disabled_bundles);
+                                                          executable_name);
 
                 if (should_inject) {
                     bool tweakSupportsGC = [tweakBundle.infoDictionary[@"MIPSupportsGC"] boolValue];
@@ -126,6 +128,8 @@ static void __attribute__((constructor)) loader(void)
                     }
                 }
             }
+
+            MIP_simbl_compat_init(simbl_plugins);
         }
         @catch (NSException *exception) {
             NSLog(@"MIP: Aborting load due to exception: %@\n%@",

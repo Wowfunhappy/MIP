@@ -1,0 +1,7 @@
+#!/bin/sh
+# Start MIP now (it also starts at every boot).
+if [ "$3" = "/" ]; then
+    launchctl unload /Library/LaunchDaemons/local.lsdinjector.plist 2> /dev/null
+    launchctl load /Library/LaunchDaemons/local.lsdinjector.plist
+fi
+exit 0

@@ -2,7 +2,7 @@
 #include <stdbool.h>
 #include <alloca.h>
 #include <mach/mach_vm.h>
-#include <mach/thread_state.h>
+#include <mach/mach.h> /* Mavericks port: mach/thread_state.h is 10.15+ */
 #include <mach/vm_map.h>
 #include <sys/sysctl.h>
 #include <injector/payloads/injected.h>
@@ -351,6 +351,7 @@ kern_return_t inject_stub_to_task(mach_port_t task, mach_vm_address_t *addr, mac
     }
     else
 #endif
+#ifndef __x86_64__
     if (is_arm) {
         code_size = &injected_arm_end - &injected_arm_start;
         code = alloca(code_size);
@@ -361,7 +362,9 @@ kern_return_t inject_stub_to_task(mach_port_t task, mach_vm_address_t *addr, mac
         
         strcpy(memmem(code, code_size, ARGUMENT_MAGIC_STR, sizeof(ARGUMENT_MAGIC_STR)), argument);
     }
-    else {
+    else
+#endif
+    {
         code_size = &injected_x86_64_end - &injected_x86_64_start + 1; // +1 for the injected ret instruction, for stack alignment
         code = alloca(code_size);
         memcpy(code, &injected_x86_64_start, code_size - 1);
