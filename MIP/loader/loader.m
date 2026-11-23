@@ -80,6 +80,11 @@ bool should_inject_bundle(NSBundle *tweakBundle,
 
 static void __attribute__((constructor)) loader(void)
 {
+    /* Mavericks port: nothing is loaded into setuid/setgid processes (see
+       process_is_setugid in lsd_injector.c, which should already have kept
+       the loader out; this covers manual injection too). */
+    if (issetugid()) return;
+
     @autoreleasepool {
         @try {
 
