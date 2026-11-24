@@ -9,3 +9,4 @@ kern_return_t get_thread_port_for_task(mach_port_t task, mach_port_t *thread);
 bool task_has_image(mach_port_t task, const char *path);
 bool thread_is_in_mach_msg(mach_port_t thread);
 bool process_is_setugid(pid_t pid);
+bool find_check_in_thread(mach_port_t task, mach_port_t *thread, const char **why);

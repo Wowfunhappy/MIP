@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <sys/sysctl.h>
 #include <stdio.h>
+#include <syslog.h>
 
 // Private APIs
 extern mach_port_t xpc_dictionary_copy_mach_send(xpc_object_t, const char *);
@@ -72,7 +73,27 @@ static void handleClientMessageHook_common(uint64_t command, xpc_object_t dict)
         pid_t pid = audit_token_to_pid(token);
         if (process_is_setugid(pid)) return;
 
-        inject_to_pid(pid, MIP_loader_path(), false);
+        /* Mavericks port: into the thread that is checking in (blocked until
+           we reply; usually the main thread), or not at all - see
+           find_check_in_thread (injector/inject/inject.c). */
+        mach_port_t task = MACH_PORT_NULL;
+        if (task_for_pid(mach_task_self(), pid, &task)) {
+            syslog(LOG_ERR, "MIP: task_for_pid(%d) failed", pid);
+            return;
+        }
+        mach_port_t thread = MACH_PORT_NULL;
+        const char *why = NULL;
+        if (!find_check_in_thread(task, &thread, &why)) {
+            char path[PROC_PIDPATHINFO_MAXSIZE] = "";
+            proc_pidpath(pid, path, sizeof(path));
+            syslog(LOG_NOTICE, "MIP: not injecting into %d (%s): %s", pid, path, why);
+            mach_port_deallocate(mach_task_self(), task);
+            return;
+        }
+        kern_return_t ret = inject_to_task_thread(task, thread, MIP_loader_path());
+        if (ret) syslog(LOG_ERR, "MIP: injecting into %d failed: %d", pid, ret);
+        mach_port_deallocate(mach_task_self(), thread);
+        mach_port_deallocate(mach_task_self(), task);
     }
 }
 

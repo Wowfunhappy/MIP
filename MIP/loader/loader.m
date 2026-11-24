@@ -5,6 +5,7 @@
 #include <sys/syslimits.h>
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <pthread.h>
 #include <objc/runtime.h>
 
 #include "loader.h"
@@ -142,26 +143,25 @@ static void load_bundles(void)
 
 /* Mavericks port: where the loader runs.
 
-   launchservicesd injects the loader when a process checks in, by making the
-   process's main thread call it. An application checks in from its main
-   thread (in -[NSApplication init], or from HIToolbox in a Carbon app),
-   blocked until launchservicesd replies, so the loader runs right there, at a
-   known point. A view service (an XPC service with an NSApplication, such as
-   the save panel AppKit shows for sandboxed apps,
-   com.apple.appkit.xpc.openAndSavePanelService) checks in from a background
-   queue as its first connection arrives, while its main thread waits in the
-   run loop xpc_main runs before it starts NSApplicationMain. The loader then
-   runs whenever that thread wakes, and while it loads bundles, work queued for
-   the main thread meanwhile - the save panel the client asked for - runs in
-   that early run loop instead of after NSApplicationMain: the panel's nib
-   creates the application, NSApplicationMain can't load its own nib, and the
-   service exits (and Preview, waiting for its Export panel, hangs).
+   launchservicesd injects the loader when a process checks in, into the
+   thread that is checking in, blocked until it replies (find_check_in_thread,
+   injector/inject/inject.c) - so the loader runs at a known point. In an
+   application that is its main thread (in -[NSApplication init], or from
+   HIToolbox in a Carbon app), and bundles load there and then.
 
-   So unless it is running inside the check-in, in a process that has AppKit
-   but no application object yet, the loader waits for -[NSApplication init]
-   - where an application's bundles load - and loads the bundles there. (An
-   application already running - injected by hand, or caught up at boot - is
-   loaded into at once, as before.) */
+   A view service (an XPC service with an NSApplication, such as the save panel
+   AppKit shows for sandboxed apps) checks in from a background queue, before
+   it has an application: there the loader waits for -[NSApplication init],
+   where an application's bundles load, and loads them on the main thread
+   then. (Loading them on the main thread at another moment let the work the
+   service's client had asked for run before NSApplicationMain: the save panel
+   service exited, and Preview hung waiting for its Export panel.) A process
+   without AppKit that checks in from a background thread gets its bundles
+   from the main queue, between events.
+
+   Injected by other means - by hand with `inject`, or caught up at boot, into
+   an application already running - the loader loads at once (or, before the
+   application exists, at -[NSApplication init]). */
 
 static bool running_inside_check_in(void)
 {
@@ -205,6 +205,15 @@ static void __attribute__((constructor)) loader(void)
        have kept the loader out; this covers manual injection too). */
     if (issetugid()) return;
 
-    if (!running_inside_check_in() && load_at_application_init()) return;
-    load_bundles();
+    bool main_thread = pthread_main_np() != 0;
+    if (main_thread && running_inside_check_in()) {   /* an application checking in */
+        load_bundles();
+        return;
+    }
+    if (load_at_application_init()) return;           /* AppKit, no application yet */
+    if (!main_thread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ load_bundles(); });
+        return;
+    }
+    load_bundles();                                   /* injected into a running application */
 }

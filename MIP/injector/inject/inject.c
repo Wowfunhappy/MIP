@@ -6,6 +6,15 @@
 #include <mach/mach.h> /* Mavericks port: mach/thread_state.h is 10.15+ */
 #include <mach/vm_map.h>
 #include <sys/sysctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <mach-o/loader.h>
+#include <mach-o/fat.h>
+#include <mach-o/nlist.h>
+#include <libkern/OSByteOrder.h>
 #include <injector/payloads/injected.h>
 #include "inject.h"
 
@@ -508,4 +517,246 @@ bool process_is_setugid(pid_t pid)
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
     if (sysctl(mib, 4, &info, &size, NULL, 0) != 0 || size == 0) return true;  /* unknown: leave it alone */
     return (info.kp_proc.p_flag & P_SUGID) != 0;
+}
+
+/* Mavericks port: the thread that is checking in.
+
+   launchservicesd injects when a process checks in (_LSApplicationCheckIn,
+   command 500), before replying, so that the injected call runs at a known
+   point: in the thread blocked waiting for that reply. An application checks
+   in from its main thread, but not every process does - a view service (such
+   as AppKit's save panel service) checks in from a background queue while its
+   main thread idles in a run loop, and a call injected into the main thread
+   there runs at whatever point it next wakes. So the call goes to the thread
+   that is actually checking in: the one blocked in the kernel (waiting for
+   the reply) with _LSApplicationCheckIn among its callers (found by walking its frame
+   pointers). If there is none, nothing is injected.
+
+   _LSApplicationCheckIn's extent (from its symbol to the next function start,
+   LC_FUNCTION_STARTS) is read once per architecture from LaunchServices on
+   disk, as offsets; each process's copy is found in its dyld image list. */
+
+#define LAUNCHSERVICES_PATH "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/LaunchServices"
+#define LAUNCHSERVICES_SUFFIX "/LaunchServices.framework/Versions/A/LaunchServices"
+
+typedef struct { bool done, valid; uint64_t start, end; } check_in_range_t;
+
+static uint64_t read_uleb128(const uint8_t **p, const uint8_t *end)
+{
+    uint64_t value = 0; int shift = 0;
+    while (*p < end) {
+        uint8_t byte = *(*p)++;
+        value |= (uint64_t)(byte & 0x7f) << shift;
+        shift += 7;
+        if (!(byte & 0x80)) break;
+    }
+    return value;
+}
+
+/* Offsets of _LSApplicationCheckIn's first byte and of the next function's,
+   from LaunchServices' header, in its slice for this CPU type. */
+static bool check_in_range_from_file(cpu_type_t cpu, uint64_t *start, uint64_t *end)
+{
+    bool found = false;
+    int fd = open(LAUNCHSERVICES_PATH, O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return false; }
+    const uint8_t *file = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (file == MAP_FAILED) return false;
+    size_t size = (size_t)st.st_size;
+
+    /* The slice for this CPU type. */
+    const uint8_t *slice = NULL;
+    size_t slice_size = 0;
+    if (size >= sizeof(struct fat_header) && OSSwapBigToHostInt32(((const struct fat_header *)file)->magic) == FAT_MAGIC) {
+        uint32_t count = OSSwapBigToHostInt32(((const struct fat_header *)file)->nfat_arch);
+        const struct fat_arch *arch = (const struct fat_arch *)(file + sizeof(struct fat_header));
+        for (uint32_t i = 0; i < count && (const uint8_t *)(arch + i + 1) <= file + size; i++) {
+            if ((cpu_type_t)OSSwapBigToHostInt32(arch[i].cputype) != cpu) continue;
+            uint32_t offset = OSSwapBigToHostInt32(arch[i].offset), length = OSSwapBigToHostInt32(arch[i].size);
+            if ((uint64_t)offset + length <= size) { slice = file + offset; slice_size = length; }
+        }
+    }
+    else if (size >= sizeof(struct mach_header) && ((const struct mach_header *)file)->cputype == cpu) {
+        slice = file; slice_size = size;
+    }
+    if (!slice || slice_size < sizeof(struct mach_header_64)) goto done;
+
+    const struct mach_header *header = (const struct mach_header *)slice;
+    bool is_64 = header->magic == MH_MAGIC_64;
+    if (!is_64 && header->magic != MH_MAGIC) goto done;
+    const uint8_t *command = slice + (is_64 ? sizeof(struct mach_header_64) : sizeof(struct mach_header));
+    uint64_t text_address = 0, text_size = 0;
+    const struct symtab_command *symtab = NULL;
+    const struct linkedit_data_command *function_starts = NULL;
+    bool have_text = false;
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)command;
+        if (command + sizeof(*lc) > slice + slice_size || lc->cmdsize < sizeof(*lc)) goto done;
+        if (lc->cmd == LC_SEGMENT_64 && is_64 && strncmp(((const struct segment_command_64 *)lc)->segname, SEG_TEXT, 16) == 0) {
+            text_address = ((const struct segment_command_64 *)lc)->vmaddr; text_size = ((const struct segment_command_64 *)lc)->vmsize; have_text = true;
+        }
+        else if (lc->cmd == LC_SEGMENT && !is_64 && strncmp(((const struct segment_command *)lc)->segname, SEG_TEXT, 16) == 0) {
+            text_address = ((const struct segment_command *)lc)->vmaddr; text_size = ((const struct segment_command *)lc)->vmsize; have_text = true;
+        }
+        else if (lc->cmd == LC_SYMTAB) symtab = (const struct symtab_command *)lc;
+        else if (lc->cmd == LC_FUNCTION_STARTS) function_starts = (const struct linkedit_data_command *)lc;
+        command += lc->cmdsize;
+    }
+    if (!have_text || !symtab || !function_starts) goto done;
+    if ((uint64_t)symtab->stroff + symtab->strsize > slice_size
+        || (uint64_t)symtab->symoff + (uint64_t)symtab->nsyms * (is_64 ? sizeof(struct nlist_64) : sizeof(struct nlist)) > slice_size
+        || (uint64_t)function_starts->dataoff + function_starts->datasize > slice_size) goto done;
+
+    /* The symbol. */
+    const char *strings = (const char *)slice + symtab->stroff;
+    uint64_t symbol = 0;
+    for (uint32_t i = 0; i < symtab->nsyms; i++) {
+        uint32_t strx; uint8_t type; uint64_t value;
+        if (is_64) { const struct nlist_64 *n = (const struct nlist_64 *)(slice + symtab->symoff) + i; strx = n->n_un.n_strx; type = n->n_type; value = n->n_value; }
+        else { const struct nlist *n = (const struct nlist *)(slice + symtab->symoff) + i; strx = n->n_un.n_strx; type = n->n_type; value = n->n_value; }
+        if ((type & N_TYPE) != N_SECT || strx >= symtab->strsize) continue;
+        if (strcmp(strings + strx, "__LSApplicationCheckIn") == 0) { symbol = value; break; }
+    }
+    if (!symbol) goto done;
+
+    /* The function start after it (or the end of __TEXT). */
+    const uint8_t *p = slice + function_starts->dataoff, *p_end = p + function_starts->datasize;
+    uint64_t address = text_address;
+    bool at_symbol = false;
+    uint64_t next = text_address + text_size;
+    while (p < p_end) {
+        uint64_t delta = read_uleb128(&p, p_end);
+        if (!delta) break;
+        address += delta;
+        if (at_symbol) { next = address; break; }
+        if (address == symbol) at_symbol = true;
+    }
+    if (!at_symbol) goto done;
+    *start = symbol - text_address;
+    *end = next - text_address;
+    found = true;
+
+done:
+    munmap((void *)file, size);
+    return found;
+}
+
+/* Where the task's LaunchServices is loaded. */
+static bool task_image_address(mach_port_t task, const char *suffix, bool *is_32_bit, uint64_t *address)
+{
+    struct task_dyld_info info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    if (task_info(task, TASK_DYLD_INFO, (task_info_t)&info, &count)) return false;
+    *is_32_bit = info.all_image_info_format == TASK_DYLD_ALL_IMAGE_INFO_32;
+    uint8_t header[16];
+    mach_vm_size_t size = 0;
+    if (mach_vm_read_overwrite(task, info.all_image_info_addr, sizeof(header), (mach_vm_address_t)header, &size)) return false;
+    uint32_t image_count = *(uint32_t *)(header + 4);
+    uint64_t images = *is_32_bit ? *(uint32_t *)(header + 8) : *(uint64_t *)(header + 8);
+    if (!images) return false;
+    size_t pointer_size = *is_32_bit ? 4 : 8, suffix_length = strlen(suffix);
+    for (uint32_t i = 0; i < image_count; i++) {
+        uint64_t entry[2] = { 0, 0 };   /* load address, path */
+        uint8_t raw[16];
+        if (mach_vm_read_overwrite(task, images + i * 3 * pointer_size, 2 * pointer_size, (mach_vm_address_t)raw, &size)) return false;
+        if (*is_32_bit) { entry[0] = *(uint32_t *)raw; entry[1] = *(uint32_t *)(raw + 4); }
+        else { entry[0] = *(uint64_t *)raw; entry[1] = *(uint64_t *)(raw + 8); }
+        if (!entry[1]) continue;
+        /* The path's last bytes: read its start, find its end. */
+        char path[1025];
+        mach_vm_size_t got = 0;
+        /* (A read running past the end of the path's mapping fails: then a shorter one.) */
+        if (mach_vm_read_overwrite(task, entry[1], 1024, (mach_vm_address_t)path, &got)
+            && mach_vm_read_overwrite(task, entry[1], 256, (mach_vm_address_t)path, &got)) continue;
+        path[got] = 0;
+        size_t length = strnlen(path, sizeof(path));
+        if (length >= suffix_length && strcmp(path + length - suffix_length, suffix) == 0) { *address = entry[0]; return true; }
+    }
+    return false;
+}
+
+/* Whether one of the thread's callers (by its frame pointers) is in [start, end). */
+static bool thread_has_caller_in(mach_port_t task, mach_port_t thread, uint64_t start, uint64_t end)
+{
+    x86_thread_state_t state;
+    mach_msg_type_number_t count = x86_THREAD_STATE_COUNT;
+    if (thread_get_state(thread, x86_THREAD_STATE, (thread_state_t)&state, &count)) return false;
+    bool is_64 = state.tsh.flavor == x86_THREAD_STATE64;
+    uint64_t frame = is_64 ? state.uts.ts64.__rbp : state.uts.ts32.__ebp;
+    size_t pointer_size = is_64 ? 8 : 4;
+    for (int depth = 0; depth < 64 && frame && !(frame & (pointer_size - 1)); depth++) {
+        uint8_t raw[16];
+        mach_vm_size_t size = 0;
+        if (mach_vm_read_overwrite(task, frame, 2 * pointer_size, (mach_vm_address_t)raw, &size) || size != 2 * pointer_size) return false;
+        uint64_t next = is_64 ? *(uint64_t *)raw : *(uint32_t *)raw;
+        uint64_t return_address = is_64 ? *(uint64_t *)(raw + 8) : *(uint32_t *)(raw + 4);
+        if (return_address > start && return_address <= end) return true;   /* a return address follows its call */
+        if (next <= frame) return false;   /* frames go up the stack */
+        frame = next;
+    }
+    return false;
+}
+
+/* Whether the thread is blocked in the kernel - as the one checking in is,
+   waiting for launchservicesd's reply (in semaphore_wait_trap, under
+   xpc_connection_send_message_with_reply_sync). */
+static bool thread_is_blocked(mach_port_t thread)
+{
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count)) return false;
+    return info.run_state == TH_STATE_WAITING;
+}
+
+static pthread_mutex_t check_in_ranges_lock = PTHREAD_MUTEX_INITIALIZER;
+static check_in_range_t check_in_ranges[2];    /* [0] x86_64, [1] i386 */
+
+bool find_check_in_thread(mach_port_t task, mach_port_t *thread_out, const char **why)
+{
+    bool is_32_bit = false;
+    uint64_t launchservices = 0;
+    if (!task_image_address(task, LAUNCHSERVICES_SUFFIX, &is_32_bit, &launchservices)) {
+        *why = "LaunchServices not found in its images";
+        return false;
+    }
+
+    pthread_mutex_lock(&check_in_ranges_lock);
+    check_in_range_t *range = &check_in_ranges[is_32_bit ? 1 : 0];
+    if (!range->done) {
+        range->valid = check_in_range_from_file(is_32_bit ? CPU_TYPE_I386 : CPU_TYPE_X86_64, &range->start, &range->end);
+        range->done = true;
+    }
+    check_in_range_t r = *range;
+    pthread_mutex_unlock(&check_in_ranges_lock);
+    if (!r.valid) {
+        *why = "_LSApplicationCheckIn not found in LaunchServices";
+        return false;
+    }
+
+    thread_array_t threads = NULL;
+    mach_msg_type_number_t thread_count = 0;
+    if (task_threads(task, &threads, &thread_count)) {
+        *why = "its threads could not be listed";
+        return false;
+    }
+    /* The main thread (the first) first: an application's. */
+    mach_port_t found = MACH_PORT_NULL;
+    for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
+        if (found == MACH_PORT_NULL && thread_is_blocked(threads[i])
+            && thread_has_caller_in(task, threads[i], launchservices + r.start, launchservices + r.end)) {
+            found = threads[i];
+            continue;
+        }
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, thread_count * sizeof(threads[0]));
+    if (found == MACH_PORT_NULL) {
+        *why = "no thread is waiting in _LSApplicationCheckIn";
+        return false;
+    }
+    *thread_out = found;
+    return true;
 }
