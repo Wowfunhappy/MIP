@@ -530,7 +530,8 @@ bool process_is_setugid(pid_t pid)
    there runs at whatever point it next wakes. So the call goes to the thread
    that is actually checking in: the one blocked in the kernel (waiting for
    the reply) with _LSApplicationCheckIn among its callers (found by walking its frame
-   pointers). If there is none, nothing is injected.
+   pointers; it is waited for if it hasn't blocked yet). If there is none,
+   nothing is injected.
 
    _LSApplicationCheckIn's extent (from its symbol to the next function start,
    LC_FUNCTION_STARTS) is read once per architecture from LaunchServices on
@@ -736,25 +737,39 @@ bool find_check_in_thread(mach_port_t task, mach_port_t *thread_out, const char 
         return false;
     }
 
-    thread_array_t threads = NULL;
-    mach_msg_type_number_t thread_count = 0;
-    if (task_threads(task, &threads, &thread_count)) {
-        *why = "its threads could not be listed";
-        return false;
-    }
-    /* The main thread (the first) first: an application's. */
+    /* The thread sends its check-in, then waits for the reply - and the
+       check-in can reach us in between, while it is still running. It can't
+       go on without the reply, so it is waited for: the threads are looked at
+       again every 0.1 ms, for up to 100 ms. */
     mach_port_t found = MACH_PORT_NULL;
-    for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
-        if (found == MACH_PORT_NULL && thread_is_blocked(threads[i])
-            && thread_has_caller_in(task, threads[i], launchservices + r.start, launchservices + r.end)) {
-            found = threads[i];
-            continue;
+    unsigned in_check_in = 0;   /* (at the last look) threads with it among their callers, blocked or not */
+    for (int attempt = 0; attempt < 1000 && found == MACH_PORT_NULL; attempt++) {
+        in_check_in = 0;
+        if (attempt) usleep(100);
+        thread_array_t threads = NULL;
+        mach_msg_type_number_t thread_count = 0;
+        if (task_threads(task, &threads, &thread_count)) {
+            *why = "its threads could not be listed";
+            return false;
         }
-        mach_port_deallocate(mach_task_self(), threads[i]);
+        /* The main thread (the first) first: an application's. */
+        for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
+            if (found == MACH_PORT_NULL && thread_has_caller_in(task, threads[i], launchservices + r.start, launchservices + r.end)) {
+                in_check_in++;
+                if (!thread_is_blocked(threads[i])) {
+                    mach_port_deallocate(mach_task_self(), threads[i]);
+                    continue;
+                }
+                found = threads[i];
+                continue;
+            }
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)threads, thread_count * sizeof(threads[0]));
     }
-    vm_deallocate(mach_task_self(), (vm_address_t)threads, thread_count * sizeof(threads[0]));
     if (found == MACH_PORT_NULL) {
-        *why = "no thread is waiting in _LSApplicationCheckIn";
+        *why = in_check_in ? "a thread in _LSApplicationCheckIn didn't block within 100 ms"
+                           : "no thread is in _LSApplicationCheckIn";
         return false;
     }
     *thread_out = found;
