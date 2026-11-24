@@ -50,7 +50,7 @@ build/loader.dylib: $(LOADER_SOURCES) loader/loader.h loader/simbl_compat.h
 	$(CODESIGN_TARGET) $@
 
 build/inject: build/injector/inject.c.o build/injector/direct_inject.c.o build/injector/injector.o
-	$(CC) $(LDFLAGS) -arch x86_64 $^ -o $@
+	$(CC) $(LDFLAGS) -arch x86_64 $^ -o $@ -framework CoreFoundation -framework CoreServices
 	$(CODESIGN_TARGET) $@
 
 build/injector/injector.o: build/injector/inject/inject.c.o build/injector/payloads/injected_x86_64.c.bin build/injector/payloads/injected_i386.c.bin

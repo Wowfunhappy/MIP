@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <stdbool.h>
 #include <alloca.h>
 #include <mach/mach_vm.h>
@@ -402,12 +403,24 @@ kern_return_t inject_to_task(mach_port_t task, const char *argument)
     mach_port_t thread;
     kern_return_t ret = KERN_SUCCESS;
     
-    if (strlen(argument) + 1 > ARGUMENT_MAX_LENGTH) {
-        return KERN_INVALID_ARGUMENT;
-    }
-    
     if ((ret = get_thread_port_for_task(task, &thread))) {
         return ret;
+    }
+    
+    ret = inject_to_task_thread(task, thread, argument);
+    mach_port_destroy(mach_task_self(), thread);
+    return ret;
+}
+
+/* Mavericks port: inject_to_task, with the main thread's port given by the
+   caller (and left to it): ports for the same thread share a name, so
+   destroying one would take the caller's away too. */
+kern_return_t inject_to_task_thread(mach_port_t task, mach_port_t thread, const char *argument)
+{
+    kern_return_t ret = KERN_SUCCESS;
+    
+    if (strlen(argument) + 1 > ARGUMENT_MAX_LENGTH) {
+        return KERN_INVALID_ARGUMENT;
     }
     
     mach_vm_address_t code_addr = 0;
@@ -416,7 +429,6 @@ kern_return_t inject_to_task(mach_port_t task, const char *argument)
     bool arm = is_arm(task);
     
     if ((ret = inject_stub_to_task(task, &code_addr, &ret_addr, argument, arm, &is_32_bit))) {
-        mach_port_destroy(mach_task_self(), thread);
         return ret;
     }
     
@@ -433,6 +445,67 @@ kern_return_t inject_to_task(mach_port_t task, const char *argument)
         ret = inject_call_to_thread_x86_64(task, thread, code_addr, ret_addr);
     }
     
-    mach_port_destroy(mach_task_self(), thread);
     return ret;
+}
+
+/* Mavericks port: whether an image with this exact path is in the task's dyld
+   image list (as dlopen records it: the path it was given). */
+bool task_has_image(mach_port_t task, const char *path)
+{
+    struct task_dyld_info info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    if (task_info(task, TASK_DYLD_INFO, (task_info_t)&info, &count)) return false;
+    bool is_32_bit = info.all_image_info_format == TASK_DYLD_ALL_IMAGE_INFO_32;
+
+    /* dyld_all_image_infos starts { uint32_t version; uint32_t infoArrayCount; infoArray pointer }. */
+    uint8_t header[16];
+    mach_vm_size_t size = 0;
+    if (mach_vm_read_overwrite(task, info.all_image_info_addr, sizeof(header), (mach_vm_address_t)header, &size)) return false;
+    uint32_t image_count = *(uint32_t *)(header + 4);
+    uint64_t images = is_32_bit ? *(uint32_t *)(header + 8) : *(uint64_t *)(header + 8);
+    if (!images) return false;   /* dyld is changing the list */
+
+    /* Each dyld_image_info: { load address, path, modification date }, pointer-sized. */
+    size_t pointer_size = is_32_bit ? 4 : 8;
+    size_t length = strlen(path) + 1;
+    char name[length];
+    for (uint32_t i = 0; i < image_count; i++) {
+        uint64_t name_address = 0;
+        if (mach_vm_read_overwrite(task, images + i * 3 * pointer_size + pointer_size, pointer_size,
+                                   (mach_vm_address_t)&name_address, &size)) return false;
+        if (!name_address) continue;
+        if (mach_vm_read_overwrite(task, name_address, length, (mach_vm_address_t)name, &size)) continue;
+        if (memcmp(name, path, length) == 0) return true;
+    }
+    return false;
+}
+
+/* Mavericks port: whether a suspended thread is blocked in mach_msg_trap, as
+   an application's main thread is while idle in its run loop, so that a call
+   injected there runs where no lock of the application's is held. (In a
+   blocked trap the saved rax/eax still holds the trap number.) */
+bool thread_is_in_mach_msg(mach_port_t thread)
+{
+    x86_thread_state_t state;
+    mach_msg_type_number_t count = x86_THREAD_STATE_COUNT;
+    if (thread_get_state(thread, x86_THREAD_STATE, (thread_state_t)&state, &count)) return false;
+    if (state.tsh.flavor == x86_THREAD_STATE64) return state.uts.ts64.__rax == 0x100001f;  /* SYSCALL_CLASS_MACH | 31 */
+    return state.uts.ts32.__eax == (uint32_t)-31;                                            /* i386 mach traps: -number */
+}
+
+/* Mavericks port: setuid/setgid processes (P_SUGID: what issetugid() reports
+   in the process itself) are left alone, as dyld leaves them alone with
+   DYLD_INSERT_LIBRARIES. Bundles have no business running with privileges the
+   user doesn't have, and AppKit refuses to run in such processes: the first
+   use of NSApplication or NSWindow logs "...is running setugid(), which is
+   not allowed." and exits. A process like VMware Fusion's vmware-vmx (setuid
+   root) links AppKit without using it, and a bundle loaded into it - any
+   that touches NSWindow as it loads - kills it. The loader checks too. */
+bool process_is_setugid(pid_t pid)
+{
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+    if (sysctl(mib, 4, &info, &size, NULL, 0) != 0 || size == 0) return true;  /* unknown: leave it alone */
+    return (info.kp_proc.p_flag & P_SUGID) != 0;
 }

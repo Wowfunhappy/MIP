@@ -8,6 +8,7 @@
 #include <mach-o/loader.h>
 #include <mach-o/dyld.h>
 #include "injectd_client/injectd_client.h"
+#include "inject/inject.h"
 #include <stdbool.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
@@ -48,22 +49,8 @@ static const char *MIP_root_path(void)
     return ret;
 }
 
-/* Mavericks port: setuid/setgid processes (P_SUGID: what issetugid() reports
-   in the process itself) are left alone, as dyld leaves them alone with
-   DYLD_INSERT_LIBRARIES. Bundles have no business running with privileges the
-   user doesn't have, and AppKit refuses to run in such processes: the first
-   use of NSApplication or NSWindow logs "...is running setugid(), which is
-   not allowed." and exits. A process like VMware Fusion's vmware-vmx (setuid
-   root) links AppKit without using it, and a bundle loaded into it - any
-   that touches NSWindow as it loads - kills it. The loader checks too. */
-static bool process_is_setugid(pid_t pid)
-{
-    struct kinfo_proc info;
-    size_t size = sizeof(info);
-    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
-    if (sysctl(mib, 4, &info, &size, NULL, 0) != 0 || size == 0) return true;  /* unknown: leave it alone */
-    return (info.kp_proc.p_flag & P_SUGID) != 0;
-}
+/* Mavericks port: process_is_setugid (inject/inject.c) keeps setuid/setgid
+   processes out. */
 
 static void handleClientMessageHook_common(uint64_t command, xpc_object_t dict)
 {
