@@ -16,7 +16,8 @@
     - After loading, +install is sent to the principal class if it responds.
 
    Like SIMBLAgent, only applications are considered (not XPC services or
-   other helpers), and osascript, Google Chrome Helper and loginwindow are
+   other helpers - including view services, which report their client app as
+   their main bundle), and osascript, Google Chrome Helper and loginwindow are
    skipped.
 
    SIMBL plugins were injected with an Apple Event after the application had
@@ -36,6 +37,8 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <sys/syslimits.h>
 #import "simbl_compat.h"
 
 #define objc_collectingEnabled() (@selector(retain) == @selector(release))
@@ -114,6 +117,16 @@ static BOOL SIMBLProcessIsEligible(NSBundle *app)
 
     // SIMBLAgent only ever targeted applications.
     if (![[app.bundlePath pathExtension] isEqualToString:@"app"]) return NO;
+
+    // ...and only their own processes. A view service (an XPC service such as
+    // the save panel AppKit shows for a sandboxed app) reports its client app
+    // as its main bundle, but runs an executable of its own elsewhere.
+    char executable[PATH_MAX];
+    uint32_t length = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &length) != 0) return NO;
+    NSString *executablePath = [@(executable) stringByResolvingSymlinksInPath];
+    NSString *bundlePath = [app.bundlePath stringByResolvingSymlinksInPath];
+    if (![executablePath hasPrefix:[bundlePath stringByAppendingString:@"/"]]) return NO;
 
     NSString *name = [[NSProcessInfo processInfo] processName];
     if ([@[@"osascript", @"Google Chrome Helper"] containsObject:name]) return NO;

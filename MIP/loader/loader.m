@@ -4,6 +4,8 @@
 #include <mach-o/dyld.h>
 #include <sys/syslimits.h>
 #include <dlfcn.h>
+#include <execinfo.h>
+#include <objc/runtime.h>
 
 #include "loader.h"
 #include "simbl_compat.h"
@@ -78,13 +80,8 @@ bool should_inject_bundle(NSBundle *tweakBundle,
     return blacklistMode;
 }
 
-static void __attribute__((constructor)) loader(void)
+static void load_bundles(void)
 {
-    /* Mavericks port: nothing is loaded into setuid/setgid processes (see
-       process_is_setugid in lsd_injector.c, which should already have kept
-       the loader out; this covers manual injection too). */
-    if (issetugid()) return;
-
     @autoreleasepool {
         @try {
 
@@ -141,4 +138,73 @@ static void __attribute__((constructor)) loader(void)
                   exception, exception.callStackSymbols);
         }
     }
+}
+
+/* Mavericks port: where the loader runs.
+
+   launchservicesd injects the loader when a process checks in, by making the
+   process's main thread call it. An application checks in from its main
+   thread (in -[NSApplication init], or from HIToolbox in a Carbon app),
+   blocked until launchservicesd replies, so the loader runs right there, at a
+   known point. A view service (an XPC service with an NSApplication, such as
+   the save panel AppKit shows for sandboxed apps,
+   com.apple.appkit.xpc.openAndSavePanelService) checks in from a background
+   queue as its first connection arrives, while its main thread waits in the
+   run loop xpc_main runs before it starts NSApplicationMain. The loader then
+   runs whenever that thread wakes, and while it loads bundles, work queued for
+   the main thread meanwhile - the save panel the client asked for - runs in
+   that early run loop instead of after NSApplicationMain: the panel's nib
+   creates the application, NSApplicationMain can't load its own nib, and the
+   service exits (and Preview, waiting for its Export panel, hangs).
+
+   So unless it is running inside the check-in, in a process that has AppKit
+   but no application object yet, the loader waits for -[NSApplication init]
+   - where an application's bundles load - and loads the bundles there. (An
+   application already running - injected by hand, or caught up at boot - is
+   loaded into at once, as before.) */
+
+static bool running_inside_check_in(void)
+{
+    void *frames[256];
+    int count = backtrace(frames, 256);
+    for (int i = 0; i < count; i++) {
+        Dl_info info;
+        if (dladdr(frames[i], &info) && info.dli_sname && strcmp(info.dli_sname, "_LSApplicationCheckIn") == 0) return true;
+    }
+    return false;
+}
+
+static id (*original_application_init)(id, SEL);
+
+static id application_init(id self, SEL _cmd)
+{
+    self = original_application_init(self, _cmd);
+    static bool loaded = false;
+    if (self && !loaded && [NSThread isMainThread]) {
+        loaded = true;
+        load_bundles();
+    }
+    return self;
+}
+
+static bool load_at_application_init(void)
+{
+    Class application = objc_getClass("NSApplication");
+    id *app = (id *)dlsym(RTLD_DEFAULT, "NSApp");
+    if (!application || !app || *app) return false;
+    Method init = class_getInstanceMethod(application, @selector(init));
+    if (!init) return false;
+    original_application_init = (id (*)(id, SEL))method_setImplementation(init, (IMP)application_init);
+    return true;
+}
+
+static void __attribute__((constructor)) loader(void)
+{
+    /* Mavericks port: nothing is loaded into setuid/setgid processes (see
+       process_is_setugid in injector/inject/inject.c, which should already
+       have kept the loader out; this covers manual injection too). */
+    if (issetugid()) return;
+
+    if (!running_inside_check_in() && load_at_application_init()) return;
+    load_bundles();
 }
