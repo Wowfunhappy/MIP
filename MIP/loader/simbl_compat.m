@@ -41,9 +41,13 @@
 #import <sys/syslimits.h>
 #import "simbl_compat.h"
 
-#define objc_collectingEnabled() (@selector(retain) == @selector(release))
-
-static NSArray *gPlugins;
+/* Garbage collection: the loader is marked as supporting GC (markgc, in the
+   Makefile), so it loads into GC applications too. It isn't compiled for GC
+   (current compilers can't), so nothing it stores has write barriers, and the
+   collector doesn't see plain globals or ivars: an object kept beyond the
+   stack must be CFRetain'd (which roots it under GC, and is an ordinary
+   retain otherwise) and let go with CFRelease. */
+static NSArray *gPlugins;      /* CFRetain'd */
 
 BOOL MIP_is_simbl_plugin(NSBundle *bundle)
 {
@@ -158,11 +162,9 @@ static void SIMBLLoadPlugins(SIMBLPhase phase)
                 if (SIMBLWantsEarlyLoad(plugin) != (phase == SIMBLEarlyPlugins)) continue;
                 if (!SIMBLShouldLoad(plugin, app)) continue;
 
-                if (objc_collectingEnabled()) {
-                    NSLog(@"MIP: SIMBL plugin %@ was not loaded: %@ uses garbage collection", identifier, identifier);
-                    continue;
-                }
-
+                /* In a GC application, a plugin not built to support GC is
+                   refused by the runtime ("GC capability mismatch"), and the
+                   load fails, as under SIMBL. */
                 NSError *error = nil;
                 if (![plugin loadAndReturnError:&error]) {
                     NSLog(@"MIP: failed to load the SIMBL plugin %@: %@", identifier, error);
@@ -198,18 +200,21 @@ static BOOL SIMBLApplicationHasFinishedLaunching(void)
 void MIP_simbl_compat_init(NSArray *plugins)
 {
     if (!plugins.count) return;
-    gPlugins = [plugins copy];
+    gPlugins = (NSArray *)CFRetain([NSArray arrayWithArray:plugins]);
     SIMBLLoadPlugins(SIMBLEarlyPlugins);
     if (SIMBLApplicationHasFinishedLaunching()) {
         SIMBLLoadPlugins(SIMBLRemainingPlugins);
         return;
     }
+    /* Kept until it fires: under GC the notification center holds observers weakly. */
     __block id observer = [[NSNotificationCenter defaultCenter]
         addObserverForName:@"NSApplicationDidFinishLaunchingNotification"
                     object:nil
                      queue:nil
                 usingBlock:^(NSNotification *note) {
                     [[NSNotificationCenter defaultCenter] removeObserver:observer];
+                    CFRelease(observer);
                     SIMBLLoadPlugins(SIMBLRemainingPlugins);
                 }];
+    CFRetain(observer);
 }

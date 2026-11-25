@@ -45,9 +45,19 @@ build/lsdinjector.dylib: build/injector/lsd_injector.c.o build/injector/direct_i
 	$(CC) $(LDFLAGS) -arch x86_64 $^ -lbsm -shared -o $@
 	$(CODESIGN_TARGET) $@
 
-build/loader.dylib: $(LOADER_SOURCES) loader/loader.h loader/simbl_compat.h
+build/loader.dylib: $(LOADER_SOURCES) loader/loader.h loader/simbl_compat.h build/markgc
 	$(CC) $(CFLAGS) $(SUBSTITUTE_CFLAGS) $(LDFLAGS) -install_name $(MIP_ROOT)/loader.dylib -framework Foundation -shared -arch x86_64 -arch i386 $(filter %.m %.c %.S,$^) -o $@
+	build/markgc $@ > /dev/null
 	$(CODESIGN_TARGET) $@
+
+# Mavericks port: restored from upstream's first version. Apple's tool (from the
+# Obj-C runtime) marks the loader as supporting garbage collection, which
+# current compilers can't build (-fobjc-gc), so that it loads into GC
+# applications as well; without it the runtime refuses it there. The loader
+# keeps what it stores CFRetain'd, which the collector sees (simbl_compat.m).
+build/markgc: third-party/markgc.cpp
+	@mkdir -p build
+	clang++ $^ -std=c++11 -o $@
 
 build/inject: build/injector/inject.c.o build/injector/direct_inject.c.o build/injector/injector.o
 	$(CC) $(LDFLAGS) -arch x86_64 $^ -o $@ -framework CoreFoundation -framework CoreServices
